@@ -1,4 +1,12 @@
 __pycache__/
 *.pyc
-memo.db
+*.db
+*.db-journal
 .venv/
+
+# 비밀값/플래그는 절대 커밋하지 않음
+*.env
+!deploy/memo.env.example
+!deploy/seed.env.example
+flag
+flag.txt

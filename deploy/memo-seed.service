@@ -1,0 +1,30 @@
+# /etc/systemd/system/memo-seed.service
+#
+# 플래그 파일(/etc/memo/flag, root 전용)을 읽어 admin 계정과 admin 메모를 DB 에 시드하는 1회성 유닛.
+# root 로 실행되며, 끝나면 DB 소유권을 앱 전용 유저(memoapp)로 넘긴다.
+# 앱 프로세스(memo.service)는 이 유닛이 성공한 뒤에만 기동된다.
+#
+# [방어] 플래그 파일을 읽는 권한(root)과 웹 요청을 처리하는 권한(memoapp)을 분리.
+#        앱이 뚫려 memoapp 권한으로 코드가 실행돼도 /etc/memo/flag 자체는 읽을 수 없다.
+
+[Unit]
+Description=Memo service - seed admin account and flag memo
+After=network.target
+ConditionPathExists=/etc/memo/flag
+ConditionPathExists=/etc/memo/seed.env
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+UMask=0077
+WorkingDirectory=/opt/memo
+EnvironmentFile=/etc/memo/memo.env
+EnvironmentFile=/etc/memo/seed.env
+Environment=FLAG_FILE=/etc/memo/flag
+ExecStart=/opt/memo/.venv/bin/python /opt/memo/app.py init
+ExecStartPost=/usr/bin/chown memoapp:memoapp /var/lib/memo/memo.db
+ExecStartPost=/usr/bin/chmod 0600 /var/lib/memo/memo.db
+
+[Install]
+WantedBy=multi-user.target

@@ -1,21 +1,128 @@
+"""
+메모 서비스 (교육용 공방 CTF 방어 서버)
+
+실행 모드
+  개발:   python app.py            -> 127.0.0.1:5000, 임시 SECRET_KEY, 임시 admin 비밀번호(콘솔 출력)
+  초기화: python app.py init       -> 테이블 생성 + admin/플래그 메모 시드 (운영에서는 root로 1회 실행)
+  운영:   gunicorn app:app         -> SECRET_KEY 환경변수 필수, 없으면 기동 거부
+
+환경변수
+  SECRET_KEY          세션 서명 키 (운영 필수, 앱 프로세스)
+  ADMIN_PASSWORD      admin 비밀번호 (init 단계 필수, 앱 프로세스에는 불필요). init 마다 이 값으로 동기화됨
+  ADMIN_USERNAME      기본 admin
+  FLAG_FILE           플래그 파일 경로 (init 단계 필수). 이 파일 내용이 admin 메모 내용이 됨. 소스에는 플래그 없음
+  ADMIN_MEMO_CONTENT  FLAG_FILE 대신 환경변수로 줄 때 (권장하지 않음). 둘 다 없으면 운영 모드 init 거부
+  MEMO_DB_PATH        SQLite 파일 경로 (기본: app.py 옆 memo.db)
+  TRUST_PROXY=1       nginx 뒤에서 실행 시 X-Forwarded-For/Proto 를 신뢰 (rate limit용 IP)
+  MEMO_DEV=1          개발 모드 강제
+  MEMO_CSRF_EXEMPT    CSRF 검사를 면제할 엔드포인트 이름 목록 (예: login,register). 체커 호환용
+"""
+
+import hmac
 import os
+import secrets
 import sqlite3
+import sys
+import time
+from datetime import timedelta
 from functools import wraps
+from urllib.parse import urlsplit
 
 from flask import Flask, abort, g, redirect, render_template_string, request, session, url_for
+from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.security import check_password_hash, generate_password_hash
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATABASE = os.path.join(BASE_DIR, "memo.db")
 
-app = Flask(__name__)
-app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "dev-secret-key-change-me")
+# `python app.py` (인자 없음) 또는 MEMO_DEV=1 이면 개발 모드. `python app.py init` 은 운영 모드로 동작.
+DEV_MODE = os.environ.get("MEMO_DEV") == "1" or (__name__ == "__main__" and len(sys.argv) == 1)
 
-# 초기 관리자 계정 및 관리자 메모 (환경변수로 덮어쓸 수 있음)
+DATABASE = os.environ.get("MEMO_DB_PATH", os.path.join(BASE_DIR, "memo.db"))
+
+
+def _require_secret(name, dev_factory):
+    """운영 모드에서는 환경변수 필수. 개발 모드에서만 임시값 생성."""
+    value = os.environ.get(name)
+    if value:
+        return value
+    if DEV_MODE:
+        value = dev_factory()
+        print(f"[memo] {name} 미설정 -> 개발용 임시값 사용", file=sys.stderr)
+        return value
+    sys.exit(f"[memo] 환경변수 {name} 가 필요합니다. 운영 모드에서는 기본값을 제공하지 않습니다.")
+
+
+# [방어] 공개 저장소에 박힌 기본 SECRET_KEY 로 세션 쿠키를 위조해 admin 으로 로그인하는 공격 차단
+SECRET_KEY = _require_secret("SECRET_KEY", lambda: secrets.token_hex(32))
+
 ADMIN_USERNAME = os.environ.get("ADMIN_USERNAME", "admin")
-ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "admin1234!")
 ADMIN_MEMO_TITLE = "관리자 전용 메모"
-ADMIN_MEMO_CONTENT = os.environ.get("ADMIN_MEMO_CONTENT", "SBOB{mminjun_admin_only_memo_2026}")
+
+
+def resolve_admin_password():
+    """시드 단계에서만 호출. 앱(gunicorn) 프로세스 환경에는 ADMIN_PASSWORD 를 둘 필요가 없다."""
+    # [방어] 기본 비밀번호(admin1234!)로 admin 에 바로 로그인하는 공격 차단
+    password = _require_secret("ADMIN_PASSWORD", lambda: secrets.token_urlsafe(12))
+    if DEV_MODE and not os.environ.get("ADMIN_PASSWORD"):
+        print(f"[memo] 개발용 admin 비밀번호: {password}", file=sys.stderr)
+    return password
+
+
+def load_flag():
+    """플래그 값 결정. FLAG_FILE > ADMIN_MEMO_CONTENT > (아래 기본값)."""
+    path = os.environ.get("FLAG_FILE")
+    if path:
+        try:
+            with open(path, encoding="utf-8") as f:
+                value = f.read().strip()
+        except OSError as e:
+            sys.exit(f"[memo] FLAG_FILE 을 읽을 수 없습니다: {path} ({e})")
+        if not value:
+            sys.exit(f"[memo] FLAG_FILE 이 비어 있습니다: {path}")
+        return value
+    value = os.environ.get("ADMIN_MEMO_CONTENT")
+    if value:
+        return value
+    # [방어] 소스에 플래그를 두지 않음. 운영 모드에서 파일도 환경변수도 없으면 시드를 거부한다.
+    #        실제 플래그는 서버의 /etc/memo/flag (root 전용) 에만 존재한다.
+    if DEV_MODE:
+        print("[memo] FLAG_FILE 미설정 -> 개발용 더미 플래그 사용", file=sys.stderr)
+        return "SBOB{dev_dummy_flag_not_real}"
+    sys.exit("[memo] FLAG_FILE 환경변수가 필요합니다. 플래그는 소스코드에 포함되지 않습니다.")
+
+
+# [방어] static_folder=None: /static/<경로> 라우트 자체를 제거해 어떤 파일도 직접 서빙되지 않게 함
+app = Flask(__name__, static_folder=None)
+app.config.update(
+    SECRET_KEY=SECRET_KEY,
+    # [방어] 세션 쿠키 탈취/재사용 범위 축소: HTTPS 전용, JS 접근 불가, 크로스사이트 전송 차단(Strict), 2시간 만료
+    SESSION_COOKIE_SECURE=not DEV_MODE,
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Strict",
+    SESSION_COOKIE_NAME="memo_session",
+    PERMANENT_SESSION_LIFETIME=timedelta(hours=2),
+    # [방어] 대용량 요청으로 메모리/디스크를 채우는 DoS 차단
+    MAX_CONTENT_LENGTH=32 * 1024,
+)
+
+# [방어] nginx 뒤에서만 X-Forwarded-* 를 신뢰. 직접 접근 시 헤더 위조로 rate limit 을 우회하는 것을 방지
+if os.environ.get("TRUST_PROXY") == "1":
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=0, x_port=0, x_prefix=0)
+
+CSRF_EXEMPT = {e.strip() for e in os.environ.get("MEMO_CSRF_EXEMPT", "").split(",") if e.strip()}
+
+# 존재하지 않는 사용자 로그인 시에도 동일한 비용의 해시 검증을 수행하기 위한 더미 해시
+_DUMMY_HASH = generate_password_hash(secrets.token_hex(16))
+
+# 입력 제한
+USERNAME_MIN, USERNAME_MAX = 3, 20
+PASSWORD_MIN, PASSWORD_MAX = 8, 128
+TITLE_MAX, CONTENT_MAX = 100, 10000
+
+# rate limit: (버킷, 허용 횟수, 윈도우 초)
+# [방어] 체커 없는 교육용 공방전이므로 강하게: 로그인 실패 IP 당 15분에 5회, 가입 IP 당 1시간에 5개
+LOGIN_FAIL_LIMIT = ("login_fail", 5, 900)
+REGISTER_LIMIT = ("register", 5, 3600)
 
 
 # ---------- DB ----------
@@ -34,6 +141,10 @@ def close_db(exc):
 
 
 def init_db():
+    """테이블 생성/마이그레이션만 수행. 시드는 seed_admin() 에서 별도로 수행."""
+    db_dir = os.path.dirname(DATABASE)
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
     with sqlite3.connect(DATABASE) as db:
         db.execute(
             """
@@ -46,7 +157,6 @@ def init_db():
             )
             """
         )
-        # 이전 버전 DB에 is_admin 컬럼이 없으면 추가
         columns = {row[1] for row in db.execute("PRAGMA table_info(users)")}
         if "is_admin" not in columns:
             db.execute("ALTER TABLE users ADD COLUMN is_admin INTEGER NOT NULL DEFAULT 0")
@@ -63,39 +173,102 @@ def init_db():
             )
             """
         )
-        seed_admin(db)
-
-
-def seed_admin(db):
-    """admin 계정과 admin 전용 메모를 초기 데이터로 생성 (없을 때만)."""
-    admin = db.execute(
-        "SELECT id FROM users WHERE username = ?", (ADMIN_USERNAME,)
-    ).fetchone()
-    if admin is None:
-        cur = db.execute(
-            "INSERT INTO users (username, password_hash, is_admin) VALUES (?, ?, 1)",
-            (ADMIN_USERNAME, generate_password_hash(ADMIN_PASSWORD)),
-        )
-        admin_id = cur.lastrowid
-    else:
-        admin_id = admin[0]
-        db.execute("UPDATE users SET is_admin = 1 WHERE id = ?", (admin_id,))
-
-    has_memo = db.execute(
-        "SELECT 1 FROM memos WHERE user_id = ? AND title = ?", (admin_id, ADMIN_MEMO_TITLE)
-    ).fetchone()
-    if has_memo is None:
+        db.execute("CREATE INDEX IF NOT EXISTS idx_memos_user ON memos(user_id)")
+        # rate limit 기록
         db.execute(
-            "INSERT INTO memos (user_id, title, content) VALUES (?, ?, ?)",
-            (admin_id, ADMIN_MEMO_TITLE, ADMIN_MEMO_CONTENT),
+            """
+            CREATE TABLE IF NOT EXISTS rate_hits (
+                bucket TEXT NOT NULL,
+                key TEXT NOT NULL,
+                at REAL NOT NULL
+            )
+            """
         )
+        db.execute("CREATE INDEX IF NOT EXISTS idx_rate_hits ON rate_hits(bucket, key, at)")
+    # [방어] DB 파일을 소유자만 읽고 쓸 수 있게 제한 (같은 호스트의 다른 계정이 DB 를 읽는 것 방지)
+    try:
+        os.chmod(DATABASE, 0o600)
+    except OSError:
+        pass
+
+
+def seed_admin():
+    """admin 계정과 admin 전용 메모를 생성/동기화. 비밀번호와 메모 내용은 항상 현재 설정값으로 맞춘다."""
+    flag = load_flag()
+    password_hash = generate_password_hash(resolve_admin_password())
+    with sqlite3.connect(DATABASE) as db:
+        admin = db.execute(
+            "SELECT id FROM users WHERE username = ?", (ADMIN_USERNAME,)
+        ).fetchone()
+        if admin is None:
+            cur = db.execute(
+                "INSERT INTO users (username, password_hash, is_admin) VALUES (?, ?, 1)",
+                (ADMIN_USERNAME, password_hash),
+            )
+            admin_id = cur.lastrowid
+        else:
+            admin_id = admin[0]
+            # [방어] 환경변수만 바꾸고 재시작하면 admin 비밀번호가 교체되도록 (유출 시 즉시 회전 가능)
+            db.execute(
+                "UPDATE users SET password_hash = ?, is_admin = 1 WHERE id = ?",
+                (password_hash, admin_id),
+            )
+
+        memo = db.execute(
+            "SELECT id FROM memos WHERE user_id = ? AND title = ?", (admin_id, ADMIN_MEMO_TITLE)
+        ).fetchone()
+        if memo is None:
+            db.execute(
+                "INSERT INTO memos (user_id, title, content) VALUES (?, ?, ?)",
+                (admin_id, ADMIN_MEMO_TITLE, flag),
+            )
+        else:
+            db.execute(
+                "UPDATE memos SET content = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (flag, memo[0]),
+            )
+
+
+# ---------- Rate limit ----------
+def client_ip():
+    return request.remote_addr or "unknown"
+
+
+def rate_limited(limit_spec, key):
+    """윈도우 내 기록 수가 허용치 이상이면 True."""
+    bucket, limit, window = limit_spec
+    now = time.time()
+    db = get_db()
+    # 오래된 기록 정리 (가벼운 확률적 정리)
+    if secrets.randbelow(20) == 0:
+        db.execute("DELETE FROM rate_hits WHERE at < ?", (now - 24 * 3600,))
+        db.commit()
+    count = db.execute(
+        "SELECT COUNT(*) FROM rate_hits WHERE bucket = ? AND key = ? AND at > ?",
+        (bucket, key, now - window),
+    ).fetchone()[0]
+    return count >= limit
+
+
+def record_hit(limit_spec, key):
+    bucket = limit_spec[0]
+    db = get_db()
+    db.execute("INSERT INTO rate_hits (bucket, key, at) VALUES (?, ?, ?)", (bucket, key, time.time()))
+    db.commit()
+
+
+def clear_hits(limit_spec, key):
+    bucket = limit_spec[0]
+    db = get_db()
+    db.execute("DELETE FROM rate_hits WHERE bucket = ? AND key = ?", (bucket, key))
+    db.commit()
 
 
 # ---------- Auth helper ----------
 def login_required(view):
     @wraps(view)
     def wrapped(*args, **kwargs):
-        if "user_id" not in session:
+        if g.user is None:
             return redirect(url_for("login", next=request.path))
         return view(*args, **kwargs)
 
@@ -105,10 +278,11 @@ def login_required(view):
 def admin_required(view):
     @wraps(view)
     def wrapped(*args, **kwargs):
-        if "user_id" not in session:
+        if g.user is None:
             return redirect(url_for("login", next=request.path))
-        if not g.user or not g.user["is_admin"]:
-            abort(403)
+        # [방어] 비관리자에게는 관리자 페이지의 존재 자체를 알리지 않음 (403 대신 404)
+        if not g.user["is_admin"]:
+            abort(404)
         return view(*args, **kwargs)
 
     return wrapped
@@ -124,6 +298,46 @@ def load_current_user():
         ).fetchone()
         if g.user is None:
             session.clear()
+
+
+# ---------- CSRF ----------
+def csrf_token():
+    token = session.get("_csrf")
+    if not token:
+        token = secrets.token_urlsafe(32)
+        session["_csrf"] = token
+    return token
+
+
+app.jinja_env.globals["csrf_token"] = csrf_token
+
+
+@app.before_request
+def check_csrf():
+    # [방어] 다른 사이트에서 로그인된 사용자의 브라우저를 이용해 메모 생성/수정/삭제/로그인을 강제하는 CSRF 차단
+    if request.method != "POST":
+        return None
+    if request.endpoint in CSRF_EXEMPT:
+        return None
+    sent = request.form.get("_csrf", "")
+    expected = session.get("_csrf", "")
+    if not expected or not hmac.compare_digest(sent, expected):
+        abort(400, description="잘못된 요청입니다. 페이지를 새로 고친 뒤 다시 시도해주세요.")
+    return None
+
+
+# ---------- Security headers ----------
+@app.after_request
+def set_security_headers(resp):
+    # [방어] 인라인 스크립트/외부 리소스 전면 차단(CSP), 클릭재킹(frame-ancestors), MIME 스니핑, 리퍼러 유출 방지
+    resp.headers["Content-Security-Policy"] = (
+        "default-src 'none'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
+    )
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["X-Frame-Options"] = "DENY"
+    resp.headers["Referrer-Policy"] = "no-referrer"
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 
 # ---------- Templates ----------
@@ -168,17 +382,20 @@ INDEX_BODY = """
 REGISTER_BODY = """
 <h2>회원가입</h2>
 <form method="post">
+  <input type="hidden" name="_csrf" value="{{ csrf_token() }}">
   <p><label>아이디 <input type="text" name="username" value="{{ username }}" required></label></p>
   <p><label>비밀번호 <input type="password" name="password" required></label></p>
   <p><label>비밀번호 확인 <input type="password" name="password2" required></label></p>
   <p><button type="submit">가입</button></p>
 </form>
+<p>아이디는 영문/숫자/밑줄 3~20자, 비밀번호는 8자 이상입니다.</p>
 <p>이미 계정이 있나요? <a href="{{ url_for('login') }}">로그인</a></p>
 """
 
 LOGIN_BODY = """
 <h2>로그인</h2>
 <form method="post">
+  <input type="hidden" name="_csrf" value="{{ csrf_token() }}">
   <input type="hidden" name="next" value="{{ next }}">
   <p><label>아이디 <input type="text" name="username" value="{{ username }}" required></label></p>
   <p><label>비밀번호 <input type="password" name="password" required></label></p>
@@ -187,6 +404,13 @@ LOGIN_BODY = """
 <p>계정이 없나요? <a href="{{ url_for('register') }}">회원가입</a></p>
 """
 
+LOGOUT_BODY = """
+<h2>로그아웃</h2>
+<form method="post">
+  <input type="hidden" name="_csrf" value="{{ csrf_token() }}">
+  <p>로그아웃 하시겠습니까? <button type="submit">로그아웃</button></p>
+</form>
+"""
 
 MEMO_LIST_BODY = """
 <h2>내 메모</h2>
@@ -208,8 +432,9 @@ MEMO_LIST_BODY = """
 MEMO_FORM_BODY = """
 <h2>{{ heading }}</h2>
 <form method="post">
-  <p><label>제목<br><input type="text" name="title" value="{{ title_value }}" required></label></p>
-  <p><label>내용<br><textarea name="content" rows="10" cols="60">{{ content_value }}</textarea></label></p>
+  <input type="hidden" name="_csrf" value="{{ csrf_token() }}">
+  <p><label>제목<br><input type="text" name="title" value="{{ title_value }}" maxlength="100" required></label></p>
+  <p><label>내용<br><textarea name="content" rows="10" cols="60" maxlength="10000">{{ content_value }}</textarea></label></p>
   <p>
     <button type="submit">저장</button>
     <a href="{{ cancel_url }}">취소</a>
@@ -232,11 +457,11 @@ MEMO_DELETE_BODY = """
 <h2>메모 삭제</h2>
 <p>"<b>{{ memo.title }}</b>" 메모를 정말 삭제할까요?</p>
 <form method="post">
+  <input type="hidden" name="_csrf" value="{{ csrf_token() }}">
   <button type="submit">삭제</button>
   <a href="{{ url_for('memo_detail', memo_id=memo.id) }}">취소</a>
 </form>
 """
-
 
 ADMIN_USERS_BODY = """
 <h2>관리자: 전체 회원 목록</h2>
@@ -257,10 +482,64 @@ ADMIN_USERS_BODY = """
 </table>
 """
 
+ERROR_BODY = """
+<h2>{{ code }}</h2>
+<p>{{ description }}</p>
+<p><a href="{{ url_for('index') }}">홈으로</a></p>
+"""
+
 
 def render(title, body_template, **ctx):
     body = render_template_string(body_template, **ctx)
     return render_template_string(LAYOUT, title=title, body=body, **ctx)
+
+
+# ---------- Error pages ----------
+def _error_page(code, description):
+    if "user" not in g:
+        g.user = None
+    return render(str(code), ERROR_BODY, code=code, description=description), code
+
+
+@app.errorhandler(400)
+def bad_request(e):
+    return _error_page(400, e.description or "잘못된 요청입니다.")
+
+
+@app.errorhandler(404)
+def not_found(e):
+    return _error_page(404, "페이지를 찾을 수 없습니다.")
+
+
+@app.errorhandler(413)
+def too_large(e):
+    return _error_page(413, "요청이 너무 큽니다.")
+
+
+@app.errorhandler(429)
+def too_many(e):
+    return _error_page(429, e.description or "요청이 너무 많습니다. 잠시 후 다시 시도해주세요.")
+
+
+# ---------- Validation ----------
+def valid_username(username):
+    if not (USERNAME_MIN <= len(username) <= USERNAME_MAX):
+        return False
+    # [방어] 영문/숫자/밑줄만 허용: 공백, 제어문자, 유니코드 유사문자로 admin 을 흉내내는 계정 생성 방지
+    return all(c.isascii() and (c.isalnum() or c == "_") for c in username)
+
+
+def safe_next_url(url):
+    """내부 경로만 허용. 스킴/호스트가 있거나 // 또는 백슬래시로 시작하는 값은 거부."""
+    if not url:
+        return None
+    # [방어] //evil.com, /\\evil.com, https://evil.com 형태의 오픈 리다이렉트 차단
+    if not url.startswith("/") or url.startswith("//") or "\\" in url:
+        return None
+    parts = urlsplit(url)
+    if parts.scheme or parts.netloc:
+        return None
+    return url
 
 
 # ---------- Routes ----------
@@ -277,16 +556,21 @@ def register():
     error = None
     username = ""
     if request.method == "POST":
+        ip = client_ip()
+        # [방어] 한 IP 에서 계정을 대량 생성해 DB 를 채우거나 rate limit 을 우회하는 시도 차단
+        if rate_limited(REGISTER_LIMIT, ip):
+            abort(429, description="가입 요청이 너무 많습니다. 잠시 후 다시 시도해주세요.")
+
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "")
         password2 = request.form.get("password2", "")
 
         if not username or not password:
             error = "아이디와 비밀번호를 모두 입력해주세요."
-        elif len(username) < 3 or len(username) > 20:
-            error = "아이디는 3~20자여야 합니다."
-        elif len(password) < 4:
-            error = "비밀번호는 4자 이상이어야 합니다."
+        elif not valid_username(username):
+            error = "아이디는 영문/숫자/밑줄 3~20자여야 합니다."
+        elif not (PASSWORD_MIN <= len(password) <= PASSWORD_MAX):
+            error = f"비밀번호는 {PASSWORD_MIN}~{PASSWORD_MAX}자여야 합니다."
         elif password != password2:
             error = "비밀번호 확인이 일치하지 않습니다."
         else:
@@ -300,6 +584,7 @@ def register():
             except sqlite3.IntegrityError:
                 error = "이미 사용 중인 아이디입니다."
             else:
+                record_hit(REGISTER_LIMIT, ip)
                 return redirect(url_for("login", message="회원가입이 완료되었습니다. 로그인해주세요."))
 
     return render("회원가입", REGISTER_BODY, error=error, username=username)
@@ -314,6 +599,11 @@ def login():
     username = ""
     next_url = request.values.get("next", "")
     if request.method == "POST":
+        ip = client_ip()
+        # [방어] admin 비밀번호 무차별 대입(brute force) 차단: IP 당 10분에 10회 실패 시 잠금
+        if rate_limited(LOGIN_FAIL_LIMIT, ip):
+            abort(429, description="로그인 시도가 너무 많습니다. 10분 후 다시 시도해주세요.")
+
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "")
 
@@ -321,16 +611,21 @@ def login():
             "SELECT * FROM users WHERE username = ?", (username,)
         ).fetchone()
 
-        if user is None or not check_password_hash(user["password_hash"], password):
+        # [방어] 없는 아이디도 동일하게 해시 검증을 수행해 응답 시간 차이로 계정 존재를 추측하는 것을 어렵게 함
+        stored_hash = user["password_hash"] if user is not None else _DUMMY_HASH
+        ok = check_password_hash(stored_hash, password) and user is not None
+
+        if not ok:
+            record_hit(LOGIN_FAIL_LIMIT, ip)
             error = "아이디 또는 비밀번호가 올바르지 않습니다."
         else:
+            clear_hits(LOGIN_FAIL_LIMIT, ip)
+            # [방어] 세션 고정(session fixation) 방지: 로그인 시 기존 세션을 완전히 비우고 새로 발급
             session.clear()
             session["user_id"] = user["id"]
             session.permanent = True
-            # 외부 URL로 리다이렉트되지 않도록 내부 경로만 허용
-            if next_url.startswith("/") and not next_url.startswith("//"):
-                return redirect(next_url)
-            return redirect(url_for("index"))
+            target = safe_next_url(next_url)
+            return redirect(target or url_for("index"))
 
     return render(
         "로그인",
@@ -342,15 +637,21 @@ def login():
     )
 
 
-@app.route("/logout")
+@app.route("/logout", methods=["GET", "POST"])
 def logout():
-    session.clear()
-    return redirect(url_for("index", message="로그아웃되었습니다."))
+    # [방어] GET 링크 하나로 강제 로그아웃시키는 것을 막기 위해 실제 로그아웃은 CSRF 토큰이 있는 POST 로만 처리
+    if request.method == "POST":
+        session.clear()
+        return redirect(url_for("index", message="로그아웃되었습니다."))
+    if g.user is None:
+        return redirect(url_for("index"))
+    return render("로그아웃", LOGOUT_BODY)
 
 
 # ---------- Memo ----------
 def get_own_memo(memo_id):
     """현재 로그인한 사용자의 메모만 반환. 없거나 남의 메모면 404."""
+    # [방어] IDOR 차단: 메모 ID 와 소유자 ID 를 항상 함께 조건으로 조회. 남의 메모는 존재 여부도 노출하지 않음
     memo = get_db().execute(
         "SELECT * FROM memos WHERE id = ? AND user_id = ?", (memo_id, g.user["id"])
     ).fetchone()
@@ -365,8 +666,10 @@ def validate_memo_form():
     error = None
     if not title:
         error = "제목을 입력해주세요."
-    elif len(title) > 100:
-        error = "제목은 100자 이하여야 합니다."
+    elif len(title) > TITLE_MAX:
+        error = f"제목은 {TITLE_MAX}자 이하여야 합니다."
+    elif len(content) > CONTENT_MAX:
+        error = f"내용은 {CONTENT_MAX}자 이하여야 합니다."
     return title, content, error
 
 
@@ -468,7 +771,27 @@ def admin_users():
     return render("관리자", ADMIN_USERS_BODY, users=users)
 
 
+# ---------- Startup ----------
+# 테이블만 준비. 시드(admin/플래그)는 `python app.py init` 또는 개발 서버 기동 시에만 수행하여
+# 운영에서는 플래그 파일을 읽는 단계(root)와 앱 실행 단계(전용 유저)를 분리한다.
 init_db()
 
+
+def main(argv):
+    if len(argv) > 1 and argv[1] == "init":
+        seed_admin()
+        print(f"[memo] 초기화 완료: DB={DATABASE}, admin={ADMIN_USERNAME}")
+        return 0
+    if len(argv) > 1:
+        print("사용법: python app.py [init]", file=sys.stderr)
+        return 2
+
+    seed_admin()
+    print("[memo] 개발 모드로 실행합니다. 외부 노출 금지. 운영은 gunicorn + nginx 를 사용하세요.", file=sys.stderr)
+    # [방어] debug=False: Werkzeug 디버거 콘솔(원격 코드 실행)과 스택트레이스 노출 차단. 127.0.0.1 에만 바인딩
+    app.run(host="127.0.0.1", port=int(os.environ.get("PORT", "5000")), debug=False)
+    return 0
+
+
 if __name__ == "__main__":
-    app.run(debug=True)
+    sys.exit(main(sys.argv))
