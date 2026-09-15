@@ -312,6 +312,18 @@ def csrf_token():
 app.jinja_env.globals["csrf_token"] = csrf_token
 
 
+def csp_nonce():
+    """요청당 1회 생성되는 CSP nonce. 템플릿의 <style nonce> 와 응답 헤더에 같은 값이 들어간다."""
+    nonce = g.get("csp_nonce")
+    if not nonce:
+        nonce = secrets.token_urlsafe(16)
+        g.csp_nonce = nonce
+    return nonce
+
+
+app.jinja_env.globals["csp_nonce"] = csp_nonce
+
+
 @app.before_request
 def check_csrf():
     # [방어] 다른 사이트에서 로그인된 사용자의 브라우저를 이용해 메모 생성/수정/삭제/로그인을 강제하는 CSRF 차단
@@ -330,8 +342,11 @@ def check_csrf():
 @app.after_request
 def set_security_headers(resp):
     # [방어] 인라인 스크립트/외부 리소스 전면 차단(CSP), 클릭재킹(frame-ancestors), MIME 스니핑, 리퍼러 유출 방지
+    #        스타일은 요청마다 새로 만든 nonce 가 붙은 <style> 하나만 허용. 공격자가 주입한 style 태그는 nonce 를 몰라 무시됨
+    nonce = g.get("csp_nonce")
+    style_src = f"'nonce-{nonce}'" if nonce else "'none'"
     resp.headers["Content-Security-Policy"] = (
-        "default-src 'none'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
+        f"default-src 'none'; style-src {style_src}; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
     )
     resp.headers["X-Content-Type-Options"] = "nosniff"
     resp.headers["X-Frame-Options"] = "DENY"
@@ -341,55 +356,166 @@ def set_security_headers(resp):
 
 
 # ---------- Templates ----------
+# CSS 는 이 파일 안에 상수로 두고, 요청마다 발급되는 CSP nonce 가 붙은 <style> 하나로만 내려간다.
+STYLE = """
+:root {
+  --bg: #f4f5f7; --card: #ffffff; --text: #1f2933; --muted: #6b7280;
+  --line: #e5e7eb; --brand: #2563eb; --brand-dark: #1d4ed8;
+  --danger: #dc2626; --danger-bg: #fef2f2; --ok: #166534; --ok-bg: #f0fdf4;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--bg); color: var(--text);
+  font: 15px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", "Apple SD Gothic Neo", "Noto Sans KR", sans-serif;
+}
+a { color: var(--brand); text-decoration: none; }
+a:hover { text-decoration: underline; }
+header {
+  background: var(--card); border-bottom: 1px solid var(--line);
+}
+.bar {
+  max-width: 760px; margin: 0 auto; padding: 14px 20px;
+  display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap;
+}
+.brand { font-weight: 700; font-size: 18px; color: var(--text); }
+.brand:hover { text-decoration: none; }
+nav { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+nav .who { color: var(--muted); }
+nav .who b { color: var(--text); }
+nav .badge {
+  font-size: 12px; padding: 1px 8px; border-radius: 999px;
+  background: #eef2ff; color: var(--brand-dark); border: 1px solid #c7d2fe;
+}
+main { max-width: 760px; margin: 28px auto; padding: 0 20px; }
+.card {
+  background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+  padding: 24px 28px; box-shadow: 0 1px 2px rgba(0,0,0,.04);
+}
+h2 { margin: 0 0 16px; font-size: 22px; }
+.sub { color: var(--muted); font-size: 13px; margin: -8px 0 16px; }
+.alert { padding: 10px 14px; border-radius: 8px; margin-bottom: 16px; border: 1px solid; }
+.alert.error { background: var(--danger-bg); border-color: #fecaca; color: var(--danger); }
+.alert.info { background: var(--ok-bg); border-color: #bbf7d0; color: var(--ok); }
+label { display: block; font-weight: 600; margin-bottom: 6px; font-size: 14px; }
+.field { margin-bottom: 16px; }
+input[type=text], input[type=password], textarea {
+  width: 100%; padding: 10px 12px; border: 1px solid #d1d5db; border-radius: 8px;
+  font: inherit; background: #fff; color: var(--text);
+}
+input:focus, textarea:focus { outline: none; border-color: var(--brand); box-shadow: 0 0 0 3px rgba(37,99,235,.15); }
+textarea { resize: vertical; min-height: 200px; }
+.actions { display: flex; align-items: center; gap: 12px; margin-top: 8px; flex-wrap: wrap; }
+.btn {
+  display: inline-block; padding: 9px 16px; border-radius: 8px; border: 1px solid transparent;
+  font: inherit; font-weight: 600; cursor: pointer; background: var(--brand); color: #fff;
+}
+.btn:hover { background: var(--brand-dark); text-decoration: none; }
+.btn.secondary { background: #fff; color: var(--text); border-color: #d1d5db; }
+.btn.secondary:hover { background: #f9fafb; }
+.btn.danger { background: var(--danger); }
+.btn.danger:hover { background: #b91c1c; }
+.btn.small { padding: 5px 12px; font-size: 13px; }
+.hint { color: var(--muted); font-size: 13px; }
+.memo-list { list-style: none; margin: 0; padding: 0; }
+.memo-list li {
+  display: flex; justify-content: space-between; align-items: center; gap: 12px;
+  padding: 12px 0; border-top: 1px solid var(--line);
+}
+.memo-list li:first-child { border-top: none; }
+.memo-list a { font-weight: 600; }
+.memo-list time { color: var(--muted); font-size: 13px; white-space: nowrap; }
+.empty { color: var(--muted); text-align: center; padding: 28px 0; }
+pre.memo {
+  background: #f9fafb; border: 1px solid var(--line); border-radius: 8px;
+  padding: 16px; white-space: pre-wrap; word-break: break-word; font: 14px/1.6 ui-monospace, Consolas, monospace;
+}
+table { width: 100%; border-collapse: collapse; font-size: 14px; }
+th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--line); }
+th { color: var(--muted); font-weight: 600; font-size: 13px; background: #f9fafb; }
+tr:last-child td { border-bottom: none; }
+.tag { font-size: 12px; padding: 1px 8px; border-radius: 999px; background: #f3f4f6; color: var(--muted); }
+.tag.admin { background: #eef2ff; color: var(--brand-dark); }
+.hero { text-align: center; padding: 20px 0; }
+.hero p { color: var(--muted); margin: 8px 0 20px; }
+footer { text-align: center; color: var(--muted); font-size: 12px; padding: 24px; }
+"""
+
 LAYOUT = """
 <!doctype html>
 <html lang="ko">
 <head>
   <meta charset="utf-8">
-  <title>{{ title }}</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ title }} · 메모</title>
+  <style nonce="{{ csp_nonce() }}">{{ style }}</style>
 </head>
 <body>
-  <h1>메모 서비스</h1>
-  <p>
-    {% if g.user %}
-      <b>{{ g.user.username }}</b>님 로그인 중 |
-      <a href="{{ url_for('index') }}">홈</a> |
-      <a href="{{ url_for('memo_list') }}">메모</a> |
-      {% if g.user.is_admin %}<a href="{{ url_for('admin_users') }}">관리자</a> |{% endif %}
-      <a href="{{ url_for('logout') }}">로그아웃</a>
-    {% else %}
-      <a href="{{ url_for('login') }}">로그인</a> |
-      <a href="{{ url_for('register') }}">회원가입</a>
-    {% endif %}
-  </p>
-  <hr>
-  {% if error %}<p><b>오류:</b> {{ error }}</p>{% endif %}
-  {% if message %}<p>{{ message }}</p>{% endif %}
-  {{ body|safe }}
+  <header>
+    <div class="bar">
+      <a class="brand" href="{{ url_for('index') }}">메모</a>
+      <nav>
+        {% if g.user %}
+          <span class="who"><b>{{ g.user.username }}</b>{% if g.user.is_admin %} <span class="badge">관리자</span>{% endif %}</span>
+          <a href="{{ url_for('memo_list') }}">내 메모</a>
+          {% if g.user.is_admin %}<a href="{{ url_for('admin_users') }}">회원 관리</a>{% endif %}
+          <a href="{{ url_for('logout') }}">로그아웃</a>
+        {% else %}
+          <a href="{{ url_for('login') }}">로그인</a>
+          <a class="btn small" href="{{ url_for('register') }}">회원가입</a>
+        {% endif %}
+      </nav>
+    </div>
+  </header>
+  <main>
+    {% if error %}<div class="alert error">{{ error }}</div>{% endif %}
+    {% if message %}<div class="alert info">{{ message }}</div>{% endif %}
+    <div class="card">
+      {{ body|safe }}
+    </div>
+  </main>
+  <footer>메모 서비스</footer>
 </body>
 </html>
 """
 
 INDEX_BODY = """
-<h2>홈</h2>
-{% if g.user %}
-  <p>환영합니다, {{ g.user.username }}님. <a href="{{ url_for('memo_list') }}">내 메모 보기</a></p>
-{% else %}
-  <p>로그인하거나 회원가입을 해주세요.</p>
-{% endif %}
+<div class="hero">
+  {% if g.user %}
+    <h2>안녕하세요, {{ g.user.username }}님</h2>
+    <p>오늘의 생각을 기록해 보세요.</p>
+    <a class="btn" href="{{ url_for('memo_list') }}">내 메모 보기</a>
+    <a class="btn secondary" href="{{ url_for('memo_new') }}">새 메모 작성</a>
+  {% else %}
+    <h2>나만 볼 수 있는 메모</h2>
+    <p>가입하고 로그인하면 메모를 작성하고 보관할 수 있습니다.</p>
+    <a class="btn" href="{{ url_for('register') }}">시작하기</a>
+    <a class="btn secondary" href="{{ url_for('login') }}">로그인</a>
+  {% endif %}
+</div>
 """
 
 REGISTER_BODY = """
 <h2>회원가입</h2>
 <form method="post">
   <input type="hidden" name="_csrf" value="{{ csrf_token() }}">
-  <p><label>아이디 <input type="text" name="username" value="{{ username }}" required></label></p>
-  <p><label>비밀번호 <input type="password" name="password" required></label></p>
-  <p><label>비밀번호 확인 <input type="password" name="password2" required></label></p>
-  <p><button type="submit">가입</button></p>
+  <div class="field">
+    <label for="username">아이디</label>
+    <input id="username" type="text" name="username" value="{{ username }}" autocomplete="username" required>
+  </div>
+  <div class="field">
+    <label for="password">비밀번호</label>
+    <input id="password" type="password" name="password" autocomplete="new-password" required>
+  </div>
+  <div class="field">
+    <label for="password2">비밀번호 확인</label>
+    <input id="password2" type="password" name="password2" autocomplete="new-password" required>
+  </div>
+  <p class="hint">아이디는 영문/숫자/밑줄 3~20자, 비밀번호는 8자 이상입니다.</p>
+  <div class="actions">
+    <button class="btn" type="submit">가입하기</button>
+    <span class="hint">이미 계정이 있나요? <a href="{{ url_for('login') }}">로그인</a></span>
+  </div>
 </form>
-<p>아이디는 영문/숫자/밑줄 3~20자, 비밀번호는 8자 이상입니다.</p>
-<p>이미 계정이 있나요? <a href="{{ url_for('login') }}">로그인</a></p>
 """
 
 LOGIN_BODY = """
@@ -397,35 +523,48 @@ LOGIN_BODY = """
 <form method="post">
   <input type="hidden" name="_csrf" value="{{ csrf_token() }}">
   <input type="hidden" name="next" value="{{ next }}">
-  <p><label>아이디 <input type="text" name="username" value="{{ username }}" required></label></p>
-  <p><label>비밀번호 <input type="password" name="password" required></label></p>
-  <p><button type="submit">로그인</button></p>
+  <div class="field">
+    <label for="username">아이디</label>
+    <input id="username" type="text" name="username" value="{{ username }}" autocomplete="username" required>
+  </div>
+  <div class="field">
+    <label for="password">비밀번호</label>
+    <input id="password" type="password" name="password" autocomplete="current-password" required>
+  </div>
+  <div class="actions">
+    <button class="btn" type="submit">로그인</button>
+    <span class="hint">계정이 없나요? <a href="{{ url_for('register') }}">회원가입</a></span>
+  </div>
 </form>
-<p>계정이 없나요? <a href="{{ url_for('register') }}">회원가입</a></p>
 """
 
 LOGOUT_BODY = """
 <h2>로그아웃</h2>
+<p>정말 로그아웃 하시겠습니까?</p>
 <form method="post">
   <input type="hidden" name="_csrf" value="{{ csrf_token() }}">
-  <p>로그아웃 하시겠습니까? <button type="submit">로그아웃</button></p>
+  <div class="actions">
+    <button class="btn" type="submit">로그아웃</button>
+    <a class="btn secondary" href="{{ url_for('index') }}">취소</a>
+  </div>
 </form>
 """
 
 MEMO_LIST_BODY = """
 <h2>내 메모</h2>
-<p><a href="{{ url_for('memo_new') }}">새 메모 작성</a></p>
+<p class="sub">총 {{ memos|length }}개</p>
+<div class="actions"><a class="btn" href="{{ url_for('memo_new') }}">새 메모 작성</a></div>
 {% if memos %}
-  <ul>
+  <ul class="memo-list">
   {% for m in memos %}
     <li>
       <a href="{{ url_for('memo_detail', memo_id=m.id) }}">{{ m.title }}</a>
-      <small>({{ m.updated_at }})</small>
+      <time>{{ m.updated_at }}</time>
     </li>
   {% endfor %}
   </ul>
 {% else %}
-  <p>작성한 메모가 없습니다.</p>
+  <p class="empty">아직 작성한 메모가 없습니다.</p>
 {% endif %}
 """
 
@@ -433,40 +572,48 @@ MEMO_FORM_BODY = """
 <h2>{{ heading }}</h2>
 <form method="post">
   <input type="hidden" name="_csrf" value="{{ csrf_token() }}">
-  <p><label>제목<br><input type="text" name="title" value="{{ title_value }}" maxlength="100" required></label></p>
-  <p><label>내용<br><textarea name="content" rows="10" cols="60" maxlength="10000">{{ content_value }}</textarea></label></p>
-  <p>
-    <button type="submit">저장</button>
-    <a href="{{ cancel_url }}">취소</a>
-  </p>
+  <div class="field">
+    <label for="title">제목</label>
+    <input id="title" type="text" name="title" value="{{ title_value }}" maxlength="100" required>
+  </div>
+  <div class="field">
+    <label for="content">내용</label>
+    <textarea id="content" name="content" rows="10" maxlength="10000">{{ content_value }}</textarea>
+  </div>
+  <div class="actions">
+    <button class="btn" type="submit">저장</button>
+    <a class="btn secondary" href="{{ cancel_url }}">취소</a>
+  </div>
 </form>
 """
 
 MEMO_DETAIL_BODY = """
 <h2>{{ memo.title }}</h2>
-<p><small>작성: {{ memo.created_at }} / 수정: {{ memo.updated_at }}</small></p>
-<pre>{{ memo.content }}</pre>
-<p>
-  <a href="{{ url_for('memo_edit', memo_id=memo.id) }}">수정</a> |
-  <a href="{{ url_for('memo_delete', memo_id=memo.id) }}">삭제</a> |
-  <a href="{{ url_for('memo_list') }}">목록</a>
-</p>
+<p class="sub">작성 {{ memo.created_at }} · 수정 {{ memo.updated_at }}</p>
+<pre class="memo">{{ memo.content }}</pre>
+<div class="actions">
+  <a class="btn" href="{{ url_for('memo_edit', memo_id=memo.id) }}">수정</a>
+  <a class="btn danger" href="{{ url_for('memo_delete', memo_id=memo.id) }}">삭제</a>
+  <a class="btn secondary" href="{{ url_for('memo_list') }}">목록</a>
+</div>
 """
 
 MEMO_DELETE_BODY = """
 <h2>메모 삭제</h2>
-<p>"<b>{{ memo.title }}</b>" 메모를 정말 삭제할까요?</p>
+<p>"<b>{{ memo.title }}</b>" 메모를 삭제합니다. 되돌릴 수 없습니다.</p>
 <form method="post">
   <input type="hidden" name="_csrf" value="{{ csrf_token() }}">
-  <button type="submit">삭제</button>
-  <a href="{{ url_for('memo_detail', memo_id=memo.id) }}">취소</a>
+  <div class="actions">
+    <button class="btn danger" type="submit">삭제</button>
+    <a class="btn secondary" href="{{ url_for('memo_detail', memo_id=memo.id) }}">취소</a>
+  </div>
 </form>
 """
 
 ADMIN_USERS_BODY = """
-<h2>관리자: 전체 회원 목록</h2>
-<p>총 {{ users|length }}명</p>
-<table border="1" cellpadding="4">
+<h2>회원 관리</h2>
+<p class="sub">총 {{ users|length }}명</p>
+<table>
   <tr>
     <th>ID</th><th>아이디</th><th>권한</th><th>메모 수</th><th>가입일</th>
   </tr>
@@ -474,7 +621,7 @@ ADMIN_USERS_BODY = """
   <tr>
     <td>{{ u.id }}</td>
     <td>{{ u.username }}</td>
-    <td>{{ '관리자' if u.is_admin else '일반' }}</td>
+    <td>{% if u.is_admin %}<span class="tag admin">관리자</span>{% else %}<span class="tag">일반</span>{% endif %}</td>
     <td>{{ u.memo_count }}</td>
     <td>{{ u.created_at }}</td>
   </tr>
@@ -485,13 +632,13 @@ ADMIN_USERS_BODY = """
 ERROR_BODY = """
 <h2>{{ code }}</h2>
 <p>{{ description }}</p>
-<p><a href="{{ url_for('index') }}">홈으로</a></p>
+<div class="actions"><a class="btn secondary" href="{{ url_for('index') }}">홈으로</a></div>
 """
 
 
 def render(title, body_template, **ctx):
     body = render_template_string(body_template, **ctx)
-    return render_template_string(LAYOUT, title=title, body=body, **ctx)
+    return render_template_string(LAYOUT, title=title, body=body, style=STYLE, **ctx)
 
 
 # ---------- Error pages ----------
