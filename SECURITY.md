@@ -130,3 +130,17 @@ flag 도달 경로가 되는 것부터 심각도 순.
 - **내가 잠기는 경우**: 비밀번호를 15분에 5회 틀리면 내 IP 도 잠긴다. 급하면 서버에서 `sqlite3 /var/lib/memo/memo.db "DELETE FROM rate_hits;"` 로 초기화.
 - **Cloudflare 설정도 방어의 일부**: SSL 모드 `Full (strict)`, DNS 레코드 프록시(주황 구름) 필수. `DNS only` 로 두면 origin IP 가 그대로 노출되고 ufw 규칙에 막혀 서비스가 안 된다.
 - **Authenticated Origin Pulls** 를 켜면 IP 대역 스푸핑까지 막히는 가장 강한 조합이 된다. `nginx-memo.conf` 에 주석으로 준비되어 있다.
+
+## 7. Docker 배포 형태에 따른 변화 (교육과정 지정 코드 적용)
+
+`Dockerfile`, `compose.yaml`, `app.py` 실행 블록을 교육과정에서 지정한 형태로 맞췄다. 그 결과 systemd 경로와 비교해 달라지는 점과, 지정 코드가 건드리지 않는 파일로 보강한 내용이다.
+
+| 항목 | systemd 경로 | Docker 경로 (현재 기본) | 보강 |
+|---|---|---|---|
+| 앱 실행 유저 | memoapp (권한 없음) | 컨테이너 안 root | 컨테이너 네임스페이스가 호스트와 격리. 앱 코드에 RCE 벡터 없음 |
+| 플래그 공급 | `/etc/memo/flag` root 0400, 앱은 읽기 불가 | `.env` 의 `ADMIN_MEMO_CONTENT` → 프로세스 환경 | 앱은 환경변수를 어디에도 출력하지 않음. `.env` 는 호스트 root 0600 |
+| 웹 서버 | gunicorn | Werkzeug 개발 서버 (`debug` 없음) | 디버거/트레이스백 노출 없음. nginx 가 앞단에서 요청 제한 |
+| 이미지 내용 | 해당 없음 | `COPY . .` | `.dockerignore` 가 `.git`, DB, `.env`, 문서, `deploy/` 제외 |
+| 8000 포트 | 127.0.0.1 만 | 0.0.0.0 (Docker 가 ufw 우회) | GCP VPC 방화벽이 443/22 만 허용 |
+
+flag 도달 경로 관점에서 새로 생기는 것은 없다. 인증 계층, CSRF, rate limit, 헤더, 입력 제한은 실행 형태와 무관하게 동일하게 적용된다. 달라지는 것은 "앱이 뚫렸을 때" 의 2차 피해 범위이며, 현재 코드에 RCE 벡터가 없으므로 이 차이는 심층 방어의 한 겹이 얇아진 정도다.

@@ -5,8 +5,13 @@ __pycache__/
 .venv/
 
 # 비밀값/플래그는 절대 커밋하지 않음
+.env
 *.env
+!.env.example
 !deploy/memo.env.example
 !deploy/seed.env.example
 flag
 flag.txt
+secrets/
+# docker compose 데이터 볼륨 (DB 포함)
+data/

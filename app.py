@@ -2,9 +2,10 @@
 메모 서비스 (교육용 공방 CTF 방어 서버)
 
 실행 모드
-  개발:   python app.py            -> 127.0.0.1:5000, 임시 SECRET_KEY, 임시 admin 비밀번호(콘솔 출력)
-  초기화: python app.py init       -> 테이블 생성 + admin/플래그 메모 시드 (운영에서는 root로 1회 실행)
-  운영:   gunicorn app:app         -> SECRET_KEY 환경변수 필수, 없으면 기동 거부
+  컨테이너(운영): python app.py         -> 0.0.0.0:8000. .env 의 SECRET_KEY/ADMIN_PASSWORD/ADMIN_MEMO_CONTENT 필수, 없으면 종료
+  로컬 개발:      MEMO_DEV=1 python app.py -> 임시 SECRET_KEY, 임시 admin 비밀번호(콘솔 출력), 더미 플래그
+  초기화만:       python app.py init     -> 테이블 생성 + admin/플래그 메모 시드 후 종료 (systemd memo-seed.service 용)
+  systemd 운영:   gunicorn app:app       -> SECRET_KEY 환경변수 필수
 
 환경변수
   SECRET_KEY          세션 서명 키 (운영 필수, 앱 프로세스)
@@ -34,8 +35,9 @@ from werkzeug.security import check_password_hash, generate_password_hash
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# `python app.py` (인자 없음) 또는 MEMO_DEV=1 이면 개발 모드. `python app.py init` 은 운영 모드로 동작.
-DEV_MODE = os.environ.get("MEMO_DEV") == "1" or (__name__ == "__main__" and len(sys.argv) == 1)
+# 개발 모드는 MEMO_DEV=1 을 명시했을 때만. 컨테이너에서 `python app.py` 로 운영하므로 인자 유무로 판단하지 않는다.
+# [방어] 운영 컨테이너가 실수로 개발 모드(임시 키, 더미 플래그, Secure 없는 쿠키)로 뜨는 것을 방지
+DEV_MODE = os.environ.get("MEMO_DEV") == "1"
 
 DATABASE = os.environ.get("MEMO_DB_PATH", os.path.join(BASE_DIR, "memo.db"))
 
@@ -924,21 +926,18 @@ def admin_users():
 init_db()
 
 
-def main(argv):
-    if len(argv) > 1 and argv[1] == "init":
-        seed_admin()
-        print(f"[memo] 초기화 완료: DB={DATABASE}, admin={ADMIN_USERNAME}")
-        return 0
-    if len(argv) > 1:
-        print("사용법: python app.py [init]", file=sys.stderr)
-        return 2
-
+# `python app.py init` : 시드만 수행하고 종료 (systemd memo-seed.service 가 사용)
+if __name__ == "__main__" and len(sys.argv) > 1 and sys.argv[1] == "init":
     seed_admin()
-    print("[memo] 개발 모드로 실행합니다. 외부 노출 금지. 운영은 gunicorn + nginx 를 사용하세요.", file=sys.stderr)
-    # [방어] debug=False: Werkzeug 디버거 콘솔(원격 코드 실행)과 스택트레이스 노출 차단. 127.0.0.1 에만 바인딩
-    app.run(host="127.0.0.1", port=int(os.environ.get("PORT", "5000")), debug=False)
-    return 0
+    print(f"[memo] 초기화 완료: DB={DATABASE}, admin={ADMIN_USERNAME}")
+    sys.exit(0)
 
+# `python app.py` : 시드 후 서버 실행. 컨테이너에서는 .env 의 SECRET_KEY/ADMIN_PASSWORD/ADMIN_MEMO_CONTENT 가 없으면 여기서 종료됨
+if __name__ == "__main__":
+    seed_admin()
+    if DEV_MODE:
+        print("[memo] 개발 모드 (MEMO_DEV=1): 임시 키, 더미 플래그 사용. 외부 노출 금지.", file=sys.stderr)
+    # [방어] debug 인자를 주지 않으므로 debug=False. Werkzeug 디버거 콘솔(원격 코드 실행)과 스택트레이스 노출 없음
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv))
+    app.run(host="0.0.0.0", port=8000)

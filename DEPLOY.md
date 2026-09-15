@@ -185,3 +185,50 @@ flag 회전: `/etc/memo/flag` 교체 → 같은 명령.
 
 교육과정 공방전에는 자동 채점 봇(체커)이 없으므로 이 스위치는 필요 없다. 모든 POST 에 CSRF 토큰을 요구하는 기본 상태를 유지한다.
 훗날 폼을 GET 하지 않고 `/login` 에 바로 POST 하는 외부 도구를 붙여야 할 때만 `/etc/memo/memo.env` 에 `MEMO_CSRF_EXEMPT=login,register` 를 추가하고 재시작한다.
+
+## 9. Docker 로 실행하기 (인스턴스에 Docker 가 이미 있는 경우. 권장 경로)
+
+`Dockerfile`, `compose.yaml`, `app.py` 의 실행 블록은 교육과정에서 지정한 형태 그대로다. 그 코드가 건드리지 않는 파일들로 방어를 보강했다.
+
+| 지정 코드 | 그대로 두면 생기는 위험 | 보강 위치 |
+|---|---|---|
+| `COPY . .` | `.git`(구 플래그·비밀번호 이력), `memo.db`, `.env` 가 이미지에 들어감 | `.dockerignore` 가 전부 제외 |
+| `ports: "8000:8000"` | 모든 인터페이스에 8000 개방. Docker 는 ufw 를 우회함 | GCP VPC 방화벽이 443/22 만 허용하므로 외부에서 8000 은 막힘. nginx 는 127.0.0.1:8000 으로 프록시 |
+| `env_file: .env` | 플래그·비밀번호가 컨테이너 프로세스 환경에 존재 | `.env` 는 호스트에서 root 0600, 커밋 금지. 앱은 환경변수를 어디에도 노출하지 않음 |
+| `CMD python app.py` (root, Werkzeug 서버) | 컨테이너 안 root. 개발 서버 | `debug` 미사용. `MEMO_DEV` 미설정 시 운영 모드(임시 키·더미 플래그 불가). 컨테이너 격리는 유지 |
+
+```bash
+# 1) 서버에서 저장소 클론 후
+cd ~/CI
+cp .env.example .env
+python3 -c "import secrets; print('SECRET_KEY=' + secrets.token_hex(32))"       # 결과를 .env 에
+python3 -c "import secrets; print('ADMIN_PASSWORD=' + secrets.token_urlsafe(24))"
+nano .env          # ADMIN_MEMO_CONTENT=SBOB{본인_값} 까지 채우기
+chmod 0600 .env
+mkdir -p data
+
+# 2) nginx / 방화벽 / SSH 는 setup.sh 로 (앱 유닛은 Docker 를 쓰므로 끈다)
+sudo bash deploy/setup.sh
+sudo systemctl disable --now memo memo-seed
+
+# 3) 앱 기동
+docker compose up -d --build
+docker compose logs -f app
+
+# 4) 검증
+docker compose exec app sh -c 'ls -a /app'                # .git, *.md, deploy, .env 가 없어야 함
+docker compose exec app ls -l /app/data                    # memo.db
+curl -sI http://127.0.0.1:8000/ | grep -i content-security
+sudo ss -tulpn | grep 8000                                 # docker-proxy 가 0.0.0.0:8000. 외부는 VPC 방화벽이 차단
+```
+
+플래그/비밀번호 교체: `.env` 수정 후 `docker compose up -d --force-recreate`. 시작 시마다 시드가 다시 돌아 admin 메모와 비밀번호가 `.env` 값으로 동기화된다.
+
+**꼭 지킬 것**
+- GCP VPC 방화벽에서 8000 을 절대 열지 않는다. ufw 규칙은 Docker 가 우회하므로 VPC 규칙이 8000 을 막는 유일한 층이다.
+- `.env` 와 `data/` 는 커밋하지 않는다 (`.gitignore` 에 있음).
+- `.dockerignore` 를 지우거나 줄이지 않는다. `COPY . .` 에서 이력 노출을 막는 유일한 장치다.
+
+## 10. Docker 없이 systemd 로 실행하기 (대안)
+
+`deploy/memo.service`, `deploy/memo-seed.service` 를 쓰는 경로. `setup.sh` 가 전부 설치한다. root 시드와 memoapp 실행 분리, systemd 샌드박스가 적용되어 Docker 경로보다 앱 프로세스 권한이 낮다. 플래그는 `/etc/memo/flag` (root 0400).

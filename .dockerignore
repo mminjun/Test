@@ -1,0 +1,21 @@
+# [방어] Dockerfile 이 COPY . . 를 쓰므로 이 목록이 이미지에 들어가는 것을 막는 유일한 장치다.
+#        .git(구 플래그/비밀번호 이력), DB, 시크릿, 데이터 볼륨, 문서, 호스트 배포 파일은 절대 포함하지 않음
+.git
+.gitignore
+.dockerignore
+__pycache__
+*.pyc
+*.db
+*.db-journal
+.venv
+.env
+*.env
+!.env.example
+secrets/
+data/
+flag
+flag.txt
+*.md
+deploy/
+compose.yaml
+Dockerfile
