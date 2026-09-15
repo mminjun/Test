@@ -20,6 +20,8 @@ trap 'rm -rf "$TMP"' EXIT
 
 curl -fsS --max-time 15 https://www.cloudflare.com/ips-v4 -o "$TMP/v4"
 curl -fsS --max-time 15 https://www.cloudflare.com/ips-v6 -o "$TMP/v6"
+# Cloudflare 목록은 파일 끝 줄바꿈이 없어 두 파일을 이어 읽으면 마지막 v4 와 첫 v6 가 한 줄로 붙는다. 줄바꿈을 보장한다
+sed -i -e '$a\' "$TMP/v4" "$TMP/v6"
 
 # 내려받은 목록이 비정상적으로 짧으면 중단 (빈 목록으로 규칙을 갈아엎는 사고 방지)
 if [[ $(wc -l < "$TMP/v4") -lt 10 || $(wc -l < "$TMP/v6") -lt 3 ]]; then
